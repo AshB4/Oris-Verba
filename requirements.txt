@@ -1,0 +1,10 @@
+faster-whisper
+sounddevice
+numpy
+webrtcvad
+pydub
+fastapi
+uvicorn
+webvtt-py
+rich
+
