@@ -1,10 +1,11 @@
 faster-whisper
+setuptools<81  # webrtcvad imports pkg_resources, removed in setuptools 81+
 sounddevice
 numpy
 webrtcvad
 pydub
 fastapi
+python-multipart
 uvicorn
 webvtt-py
 rich
-
