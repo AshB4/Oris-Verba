@@ -1,11 +1,12 @@
-import sounddevice as sd
 import numpy as np
 import queue
+import threading
 import time
 
 from settings import SAMPLE_RATE, CHUNK_SECONDS
 
 audio_queue = queue.Queue()
+stream_cleanup_lock = threading.Lock()
 
 
 def audio_callback(indata, frames, time_info, status):
@@ -15,6 +16,10 @@ def audio_callback(indata, frames, time_info, status):
 
 
 def start_capture():
+    # Importing sounddevice initializes PortAudio, so defer it until the user
+    # explicitly starts live transcription.
+    import sounddevice as sd
+
     clear_audio_queue()
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -31,14 +36,16 @@ def start_capture():
 
 
 def stop_capture(stream):
-    if stream is None:
-        return
+    with stream_cleanup_lock:
+        if stream is None or stream.closed:
+            return
 
-    try:
-        if not stream.stopped:
-            stream.stop()
-    finally:
-        stream.close()
+        try:
+            if not stream.stopped:
+                stream.stop()
+        finally:
+            if not stream.closed:
+                stream.close()
 
 
 def clear_audio_queue():
@@ -49,7 +56,7 @@ def clear_audio_queue():
             return
 
 
-def get_audio_chunk(should_continue=lambda: True):
+def get_audio_chunk(should_continue=lambda: True, should_flush=lambda: False):
     frames = []
     start = time.time()
 
@@ -58,6 +65,13 @@ def get_audio_chunk(should_continue=lambda: True):
             frames.append(audio_queue.get(timeout=0.1))
         except queue.Empty:
             pass
+
+    if should_flush():
+        while True:
+            try:
+                frames.append(audio_queue.get_nowait())
+            except queue.Empty:
+                break
 
     if not frames:
         return None

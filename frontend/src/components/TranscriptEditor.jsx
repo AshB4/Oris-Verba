@@ -1,4 +1,4 @@
-function TranscriptEditor({ result, transcript, copyLabel, error, onTranscriptChange, onCopy, onDownload, onReset }) {
+function TranscriptEditor({ result, transcript, copyLabel, error, warning, onTranscriptChange, onCopy, onDownload, onReset }) {
   return (
     <section className="transcript-card" id="file-panel" role="tabpanel">
       <div className="transcript-card-header">
@@ -11,11 +11,13 @@ function TranscriptEditor({ result, transcript, copyLabel, error, onTranscriptCh
           <span>
             {result?.language && `Language: ${result.language}`}
             {result?.segments && ` · ${result.segments.length} segments`}
+            {Number.isInteger(result?.speaker_count) && ` · ${result.speaker_count} ${result.speaker_count === 1 ? "speaker" : "speakers"}`}
           </span>
         </div>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
+      {warning && <div className="warning-banner" role="status">{warning}</div>}
 
       <textarea
         className="transcript-editor"

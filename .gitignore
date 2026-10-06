@@ -34,6 +34,7 @@ MANIFEST
 # Virtual environments
 .env
 .venv
+.venv-diarization
 env/
 venv/
 ENV/
@@ -136,3 +137,6 @@ htmlcov/
 dist/
 build/
 *.tgz
+
+# Downloaded local diarization models
+models/diarization/

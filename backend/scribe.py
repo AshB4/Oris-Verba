@@ -43,8 +43,12 @@ def looks_weird(text: str) -> bool:
     return unique_ratio < 0.5  # lots of repetition = suspicious
 
 
-def _transcribe_source(source, *, language, vad_filter):
+def _transcribe_source(source, *, language, vad_filter, progress_callback=None):
     with transcription_lock:
+        if progress_callback is not None:
+            # Model loading, decoding, VAD, and language detection do not expose
+            # reliable incremental progress through faster-whisper.
+            progress_callback(0.0, 0.0, "preparing")
         segments, info = get_model().transcribe(
             source,
             language=language,
@@ -52,8 +56,17 @@ def _transcribe_source(source, *, language, vad_filter):
             beam_size=5,
         )
         results = []
+        duration = float(getattr(info, "duration", 0) or 0)
+
+        if progress_callback is not None:
+            progress_callback(0.0, duration, "transcribing")
 
         # faster-whisper performs inference while this generator is consumed.
+        # With VAD enabled it removes silence for inference, then maps yielded
+        # segment timestamps back onto the original media timeline. Using the
+        # restored end time against info.duration therefore reports source-media
+        # coverage instead of the shorter, compressed duration_after_vad.
+        processed_seconds = 0.0
         for seg in segments:
             low_conf = seg.avg_logprob < LOW_CONF_THRESHOLD
             weird = looks_weird(seg.text)
@@ -69,11 +82,15 @@ def _transcribe_source(source, *, language, vad_filter):
                     "needs_review": needs_review,
                 }
             )
+            if progress_callback is not None:
+                processed_seconds = max(processed_seconds, float(seg.end))
+                progress_callback(processed_seconds, duration, "transcribing")
 
     return {
         "text": " ".join(segment["text"] for segment in results).strip(),
         "language": getattr(info, "language", language or "unknown"),
         "segments": results,
+        "duration": duration,
     }
 
 
@@ -85,7 +102,13 @@ def transcribe(audio: np.ndarray):
     )["segments"]
 
 
-def transcribe_file(input_path: Path, work_dir: Path, extension: str):
+def transcribe_file(
+    input_path: Path,
+    work_dir: Path,
+    extension: str,
+    progress_callback=None,
+    postprocess_callback=None,
+):
     audio_path = input_path
 
     if extension != ".wav":
@@ -120,8 +143,12 @@ def transcribe_file(input_path: Path, work_dir: Path, extension: str):
             detail = process.stderr.strip() or "FFmpeg could not decode the file."
             raise AudioDecodeError(detail)
 
-    return _transcribe_source(
+    result = _transcribe_source(
         str(audio_path),
         language=None,
         vad_filter=True,
+        progress_callback=progress_callback,
     )
+    if postprocess_callback is not None:
+        return postprocess_callback(audio_path, result)
+    return result

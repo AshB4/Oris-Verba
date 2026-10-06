@@ -16,7 +16,7 @@ function FileUploader({
         <div>
           <p className="section-kicker">Audio / video file</p>
           <h2>Transcribe a local recording</h2>
-          <p>Choose a recording from your Mac. Nothing is uploaded to an external service.</p>
+          <p>Choose a recording from this computer. Nothing is uploaded to an external service.</p>
         </div>
       </div>
 
