@@ -43,18 +43,30 @@ def looks_weird(text: str) -> bool:
     return unique_ratio < 0.5  # lots of repetition = suspicious
 
 
-def _transcribe_source(source, *, language, vad_filter, progress_callback=None):
+def _transcribe_source(
+    source,
+    *,
+    language,
+    vad_filter,
+    progress_callback=None,
+    hotwords=None,
+    initial_prompt=None,
+):
     with transcription_lock:
         if progress_callback is not None:
             # Model loading, decoding, VAD, and language detection do not expose
             # reliable incremental progress through faster-whisper.
             progress_callback(0.0, 0.0, "preparing")
-        segments, info = get_model().transcribe(
-            source,
-            language=language,
-            vad_filter=vad_filter,
-            beam_size=5,
-        )
+        transcribe_options = {
+            "language": language,
+            "vad_filter": vad_filter,
+            "beam_size": 5,
+        }
+        if hotwords:
+            transcribe_options["hotwords"] = hotwords
+        if initial_prompt:
+            transcribe_options["initial_prompt"] = initial_prompt
+        segments, info = get_model().transcribe(source, **transcribe_options)
         results = []
         duration = float(getattr(info, "duration", 0) or 0)
 
@@ -94,11 +106,13 @@ def _transcribe_source(source, *, language, vad_filter, progress_callback=None):
     }
 
 
-def transcribe(audio: np.ndarray):
+def transcribe(audio: np.ndarray, hotwords=None, initial_prompt=None):
     return _transcribe_source(
         audio,
         language="en",
         vad_filter=False,
+        hotwords=hotwords,
+        initial_prompt=initial_prompt,
     )["segments"]
 
 
@@ -108,6 +122,7 @@ def transcribe_file(
     extension: str,
     progress_callback=None,
     postprocess_callback=None,
+    hotwords=None,
 ):
     audio_path = input_path
 
@@ -148,6 +163,7 @@ def transcribe_file(
         language=None,
         vad_filter=True,
         progress_callback=progress_callback,
+        hotwords=hotwords,
     )
     if postprocess_callback is not None:
         return postprocess_callback(audio_path, result)

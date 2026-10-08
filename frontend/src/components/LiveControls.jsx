@@ -1,4 +1,17 @@
-function LiveControls({ liveStatus, liveBusy, liveError, segments, onAction }) {
+function LiveControls({
+  liveStatus,
+  liveBusy,
+  liveError,
+  segments,
+  liveTranscript,
+  copyLabel,
+  onAction,
+  onClear,
+  onCopy,
+  onDownload,
+  vocabularyHints,
+  onVocabularyHintsChange,
+}) {
   const liveLabel = liveStatus.is_starting
     ? "Starting"
     : liveStatus.is_stopping
@@ -22,6 +35,22 @@ function LiveControls({ liveStatus, liveBusy, liveError, segments, onAction }) {
           {liveLabel}
         </div>
       </div>
+
+      <label className="vocabulary-field">
+        <span>
+          <strong>Vocabulary hints</strong>
+          <small>Words the transcriber may need help recognizing.</small>
+        </span>
+        <input
+          type="text"
+          value={vocabularyHints}
+          onChange={(event) => onVocabularyHintsChange(event.target.value)}
+          maxLength={500}
+          placeholder="Names, acronyms, unusual words"
+          autoComplete="off"
+          disabled={liveBusy || liveStatus.is_running || liveStatus.is_starting || liveStatus.is_stopping}
+        />
+      </label>
 
       <div className={`live-stage ${liveStatus.is_running ? "is-listening" : ""}`}>
         <div className="live-waveform" aria-hidden="true">
@@ -69,6 +98,19 @@ function LiveControls({ liveStatus, liveBusy, liveError, segments, onAction }) {
               </button>
             </>
           )}
+          <button
+            onClick={onClear}
+            className="btn btn-ghost"
+            disabled={
+              liveBusy
+              || liveStatus.is_running
+              || liveStatus.is_starting
+              || liveStatus.is_stopping
+              || !liveTranscript
+            }
+          >
+            New session / Clear transcript
+          </button>
         </div>
         <span className="live-note">WebRTC voice activity detection enabled</span>
       </div>
@@ -82,7 +124,11 @@ function LiveControls({ liveStatus, liveBusy, liveError, segments, onAction }) {
               <p className="section-kicker">Live transcript</p>
               <h3>Captured text</h3>
             </div>
-            <span>{segments.length} {segments.length === 1 ? "segment" : "segments"}</span>
+            <div className="live-transcript-tools">
+              <span>{segments.length} {segments.length === 1 ? "segment" : "segments"}</span>
+              <button className="btn btn-copy btn-small" onClick={onCopy} disabled={!liveTranscript}>{copyLabel}</button>
+              <button className="btn btn-secondary btn-small" onClick={onDownload} disabled={!liveTranscript}>Download .txt</button>
+            </div>
           </div>
           <div className="segment-list" aria-live="polite">
             {segments.map((segment, index) => (

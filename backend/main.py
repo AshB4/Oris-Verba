@@ -32,6 +32,8 @@ FILE_JOB_TTL_SECONDS = 60 * 60
 TRANSCRIPTION_START_PERCENT = 10.0
 TRANSCRIPTION_END_PERCENT = 90.0
 DIARIZATION_END_PERCENT = 99.0
+MAX_VOCABULARY_HINTS_CHARS = 500
+LIVE_CONTEXT_MAX_WORDS = 48
 
 transcript_buffer = []
 is_running = False
@@ -43,6 +45,18 @@ capture_thread = None
 state_lock = threading.Lock()
 file_job_lock = threading.Lock()
 file_jobs = {}
+
+
+def normalize_vocabulary_hints(value):
+    if value is None:
+        return None
+    if len(value) > MAX_VOCABULARY_HINTS_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Vocabulary hints must be {MAX_VOCABULARY_HINTS_CHARS} characters or fewer.",
+        )
+    normalized = " ".join(value.split())
+    return normalized or None
 
 
 def cleanup_file_jobs(now=None):
@@ -214,8 +228,10 @@ def state_snapshot():
 
 
 @app.post("/start")
-def start():
+def start(vocabulary_hints: str | None = None):
     global active_stream, capture_thread, is_running, is_starting, last_error, should_pause
+
+    vocabulary_hints = normalize_vocabulary_hints(vocabulary_hints)
 
     with state_lock:
         if is_running or is_starting:
@@ -240,7 +256,11 @@ def start():
         is_starting = False
         is_running = True
         should_pause = False
-        capture_thread = threading.Thread(target=run_loop, args=(stream,), daemon=True)
+        capture_thread = threading.Thread(
+            target=run_loop,
+            args=(stream, vocabulary_hints),
+            daemon=True,
+        )
         capture_thread.start()
 
     return {"status": "started", **state_snapshot()}
@@ -320,9 +340,12 @@ def capture_should_flush():
         return not is_running
 
 
-def run_loop(stream):
+def run_loop(stream, vocabulary_hints=None):
     global active_stream, capture_thread, is_running, last_error, should_pause
 
+    # Each live chunk is a separate faster-whisper call, so carry a short
+    # transcript tail across calls without turning the full session into a prompt.
+    context_words = []
     try:
         while True:
             with state_lock:
@@ -353,7 +376,17 @@ def run_loop(stream):
                     break
                 continue
 
-            segments = transcribe(chunk)
+            transcribe_options = {}
+            if vocabulary_hints:
+                transcribe_options["hotwords"] = vocabulary_hints
+            if context_words:
+                transcribe_options["initial_prompt"] = " ".join(context_words)
+            segments = transcribe(chunk, **transcribe_options)
+            new_words = " ".join(
+                segment.get("text", "") for segment in segments
+            ).split()
+            if new_words:
+                context_words = (context_words + new_words)[-LIVE_CONTEXT_MAX_WORDS:]
             with state_lock:
                 transcript_buffer.extend(segments)
             if not running:
@@ -384,6 +417,18 @@ def transcript():
         return list(transcript_buffer)
 
 
+@app.delete("/transcript")
+def clear_transcript():
+    with state_lock:
+        if is_running or is_starting or active_stream is not None or capture_thread is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Stop the microphone and wait for final transcription before clearing.",
+            )
+        transcript_buffer.clear()
+        return {"status": "cleared", **state_snapshot_unlocked()}
+
+
 @app.get("/transcribe-file/progress/{job_id}")
 def transcribe_file_progress(job_id: str):
     with file_job_lock:
@@ -395,9 +440,15 @@ def transcribe_file_progress(job_id: str):
 
 
 @app.post("/transcribe-file")
-def transcribe_uploaded_file(file: UploadFile = File(...), job_id: str | None = None):
+def transcribe_uploaded_file(
+    file: UploadFile = File(...),
+    job_id: str | None = None,
+    detect_speakers: bool = True,
+    vocabulary_hints: str | None = None,
+):
     original_name = Path(file.filename or "").name
     extension = Path(original_name).suffix.lower()
+    vocabulary_hints = normalize_vocabulary_hints(vocabulary_hints)
 
     if extension not in SUPPORTED_EXTENSIONS:
         supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
@@ -424,6 +475,16 @@ def transcribe_uploaded_file(file: UploadFile = File(...), job_id: str | None = 
                     destination.write(chunk)
 
             update_file_job(job_id, status="preparing")
+            postprocess_callback = None
+            if detect_speakers:
+                postprocess_callback = lambda audio_path, transcription: add_speaker_labels(
+                    audio_path,
+                    transcription,
+                    job_id,
+                )
+            transcribe_options = {}
+            if vocabulary_hints:
+                transcribe_options["hotwords"] = vocabulary_hints
             result = transcribe_file(
                 input_path,
                 temp_dir,
@@ -434,11 +495,8 @@ def transcribe_uploaded_file(file: UploadFile = File(...), job_id: str | None = 
                     duration,
                     stage,
                 ),
-                postprocess_callback=lambda audio_path, transcription: add_speaker_labels(
-                    audio_path,
-                    transcription,
-                    job_id,
-                ),
+                postprocess_callback=postprocess_callback,
+                **transcribe_options,
             )
             update_file_job(
                 job_id,

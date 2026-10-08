@@ -9,6 +9,9 @@ import TranscribingState from "../components/TranscribingState";
 const API_BASE = "http://localhost:8000";
 const ACCEPTED_EXTENSIONS = ".wav,.mp3,.m4a,.mp4,.flac,.ogg,.webm";
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
+const DETECT_SPEAKERS_KEY = "oris-verba-detect-speakers";
+const VOCABULARY_HINTS_KEY = "oris-verba-vocabulary-hints";
+const MAX_VOCABULARY_HINTS_CHARS = 500;
 
 const initialLiveStatus = {
   is_running: false,
@@ -27,6 +30,36 @@ async function readApiResponse(response) {
   return data;
 }
 
+function downloadTextFile(text, filename) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function savedSpeakerDetectionPreference() {
+  try {
+    const saved = window.localStorage.getItem(DETECT_SPEAKERS_KEY);
+    return saved === null ? true : saved === "true";
+  } catch {
+    return true;
+  }
+}
+
+function savedVocabularyHints() {
+  try {
+    return (window.localStorage.getItem(VOCABULARY_HINTS_KEY) || "").slice(
+      0,
+      MAX_VOCABULARY_HINTS_CHARS,
+    );
+  } catch {
+    return "";
+  }
+}
+
 function Home() {
   const [mode, setMode] = useState("live");
   const [segments, setSegments] = useState([]);
@@ -34,6 +67,7 @@ function Home() {
   const [liveError, setLiveError] = useState("");
   const [liveBusy, setLiveBusy] = useState(false);
   const [livePollingActive, setLivePollingActive] = useState(false);
+  const [liveCopyLabel, setLiveCopyLabel] = useState("Copy");
 
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileStatus, setFileStatus] = useState("idle");
@@ -43,6 +77,8 @@ function Home() {
   const [fileProgress, setFileProgress] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
   const [copyLabel, setCopyLabel] = useState("Copy Transcript");
+  const [detectSpeakers, setDetectSpeakers] = useState(savedSpeakerDetectionPreference);
+  const [vocabularyHints, setVocabularyHints] = useState(savedVocabularyHints);
   const fileInputRef = useRef(null);
   const liveActionVersionRef = useRef(0);
   const progressTimerRef = useRef(null);
@@ -60,6 +96,22 @@ function Home() {
     stopFileProgressPolling();
     fileRequestRef.current?.abort();
   }, [stopFileProgressPolling]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DETECT_SPEAKERS_KEY, String(detectSpeakers));
+    } catch {
+      // Transcription still works when storage is unavailable.
+    }
+  }, [detectSpeakers]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(VOCABULARY_HINTS_KEY, vocabularyHints);
+    } catch {
+      // Transcription still works when storage is unavailable.
+    }
+  }, [vocabularyHints]);
 
   const updateLiveStatus = useCallback(async (requestVersion = liveActionVersionRef.current) => {
     const statusResponse = await fetch(`${API_BASE}/status`);
@@ -86,7 +138,10 @@ function Home() {
     const checkInitialStatus = async () => {
       const requestVersion = liveActionVersionRef.current;
       try {
-        const statusData = await updateLiveStatus(requestVersion);
+        const [statusData] = await Promise.all([
+          updateLiveStatus(requestVersion),
+          updateLiveTranscript(requestVersion),
+        ]);
         if (requestVersion === liveActionVersionRef.current && statusData.is_running) {
           setLivePollingActive(true);
         }
@@ -101,7 +156,7 @@ function Home() {
     return () => {
       cancelled = true;
     };
-  }, [updateLiveStatus]);
+  }, [updateLiveStatus, updateLiveTranscript]);
 
   useEffect(() => {
     if (!livePollingActive) return undefined;
@@ -137,7 +192,10 @@ function Home() {
     setLiveBusy(true);
     setLiveError("");
     try {
-      const response = await fetch(`${API_BASE}/${action}`, { method: "POST" });
+      const query = action === "start" && vocabularyHints.trim()
+        ? `?${new URLSearchParams({ vocabulary_hints: vocabularyHints })}`
+        : "";
+      const response = await fetch(`${API_BASE}/${action}${query}`, { method: "POST" });
       const data = await readApiResponse(response);
       setLiveStatus(data);
       setLiveError(data.error || "");
@@ -158,6 +216,47 @@ function Home() {
     } finally {
       setLiveBusy(false);
     }
+  };
+
+  const liveTranscript = segments.map((segment) => segment.text.trim()).filter(Boolean).join("\n");
+
+  const clearLiveTranscript = async () => {
+    if (liveStatus.is_running || liveStatus.is_starting || liveStatus.is_stopping || liveBusy) return;
+    if (liveTranscript && !window.confirm("Discard the current live transcript and start a new session?")) return;
+
+    liveActionVersionRef.current += 1;
+    setLiveBusy(true);
+    setLiveError("");
+    try {
+      const response = await fetch(`${API_BASE}/transcript`, { method: "DELETE" });
+      const data = await readApiResponse(response);
+      setSegments([]);
+      setLiveStatus(data);
+      setLiveCopyLabel("Copy");
+    } catch (error) {
+      setLiveError(error.message);
+      try {
+        await Promise.all([updateLiveStatus(), updateLiveTranscript()]);
+      } catch {
+        // Keep the clear error visible if state refresh also fails.
+      }
+    } finally {
+      setLiveBusy(false);
+    }
+  };
+
+  const copyLiveTranscript = async () => {
+    try {
+      await navigator.clipboard.writeText(liveTranscript);
+      setLiveCopyLabel("Copied");
+      window.setTimeout(() => setLiveCopyLabel("Copy"), 1500);
+    } catch {
+      setLiveError("Clipboard access was denied. Select the transcript and copy it manually.");
+    }
+  };
+
+  const downloadLiveTranscript = () => {
+    downloadTextFile(liveTranscript, "oris-verba-live-transcript.txt");
   };
 
   const chooseFile = (file) => {
@@ -230,7 +329,12 @@ function Home() {
     formData.append("file", selectedFile);
     const request = new XMLHttpRequest();
     fileRequestRef.current = request;
-    request.open("POST", `${API_BASE}/transcribe-file?job_id=${encodeURIComponent(jobId)}`);
+    const query = new URLSearchParams({
+      job_id: jobId,
+      detect_speakers: String(detectSpeakers),
+    });
+    if (vocabularyHints.trim()) query.set("vocabulary_hints", vocabularyHints);
+    request.open("POST", `${API_BASE}/transcribe-file?${query}`);
     request.timeout = 0;
     request.upload.onprogress = (event) => {
       if (fileJobIdRef.current !== jobId || !event.lengthComputable || event.total <= 0) return;
@@ -316,14 +420,8 @@ function Home() {
   };
 
   const downloadTranscript = () => {
-    const blob = new Blob([fileTranscript], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
     const baseName = (fileResult?.filename || "transcript").replace(/\.[^.]+$/, "");
-    link.href = url;
-    link.download = `${baseName}.txt`;
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadTextFile(fileTranscript, `${baseName}.txt`);
   };
 
   const isFileBusy = ["uploading", "preparing", "transcribing", "diarizing"].includes(fileStatus);
@@ -341,7 +439,14 @@ function Home() {
               liveBusy={liveBusy}
               liveError={liveError}
               segments={segments}
+              liveTranscript={liveTranscript}
+              copyLabel={liveCopyLabel}
               onAction={runLiveAction}
+              onClear={clearLiveTranscript}
+              onCopy={copyLiveTranscript}
+              onDownload={downloadLiveTranscript}
+              vocabularyHints={vocabularyHints}
+              onVocabularyHintsChange={setVocabularyHints}
             />
           ) : isFileBusy ? (
             <TranscribingState
@@ -373,6 +478,10 @@ function Home() {
               onTranscribe={transcribeSelectedFile}
               onReset={resetFile}
               acceptedExtensions={ACCEPTED_EXTENSIONS}
+              detectSpeakers={detectSpeakers}
+              onDetectSpeakersChange={setDetectSpeakers}
+              vocabularyHints={vocabularyHints}
+              onVocabularyHintsChange={setVocabularyHints}
             />
           )}
         </div>

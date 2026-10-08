@@ -62,6 +62,7 @@ class FakeInfo:
 
 class FakeModel:
     def transcribe(self, source, **_options):
+        self.options = _options
         if isinstance(source, str):
             assert Path(source).exists()
             assert Path(source).suffix == ".wav"
@@ -96,6 +97,39 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(transcript.status_code, 200)
         start_capture.assert_not_called()
         self.assertIsNone(main.active_stream)
+
+    def test_live_transcript_clear_is_rejected_until_capture_finishes(self):
+        segment = {
+            "start": 0.0,
+            "end": 1.0,
+            "text": "keep this",
+            "confidence": -0.1,
+            "needs_review": False,
+        }
+        with main.state_lock:
+            main.transcript_buffer.append(segment)
+            main.is_running = True
+
+        rejected = self.client.delete("/transcript")
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(self.client.get("/transcript").json(), [segment])
+
+        with main.state_lock:
+            main.is_running = False
+            main.active_stream = FakeStream()
+
+        still_stopping = self.client.delete("/transcript")
+        self.assertEqual(still_stopping.status_code, 409)
+        self.assertEqual(self.client.get("/transcript").json(), [segment])
+
+        with main.state_lock:
+            main.active_stream = None
+
+        cleared = self.client.delete("/transcript")
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(cleared.json()["status"], "cleared")
+        self.assertEqual(cleared.json()["transcript_count"], 0)
+        self.assertEqual(self.client.get("/transcript").json(), [])
 
     def test_microphone_start_pause_resume_stop(self):
         stream = FakeStream()
@@ -193,6 +227,51 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(first_stream.close_calls, 1)
         self.assertEqual(second_stream.close_calls, 1)
 
+    def test_live_session_normalizes_and_propagates_vocabulary_hints(self):
+        stream = FakeStream()
+        with patch.object(main, "start_capture", return_value=stream), patch.object(
+            main.threading, "Thread", DeferredThread
+        ):
+            started = self.client.post(
+                "/start",
+                params={"vocabulary_hints": "  Siobhan   NASA  "},
+            )
+
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(main.capture_thread.args, (stream, "Siobhan NASA"))
+
+        chunk = object()
+        chunks = iter([chunk, None])
+
+        def fake_get_audio_chunk(_should_continue, _should_flush=None):
+            item = next(chunks)
+            if item is None:
+                with main.state_lock:
+                    main.is_running = False
+            return item
+
+        with patch.object(main, "get_audio_chunk", side_effect=fake_get_audio_chunk), patch.object(
+            main, "is_speech", return_value=True
+        ), patch.object(main, "transcribe", return_value=[]) as transcribe:
+            main.run_loop(stream, main.capture_thread.args[1])
+
+        transcribe.assert_called_once_with(chunk, hotwords="Siobhan NASA")
+
+    def test_vocabulary_hints_are_bounded(self):
+        too_long = "x" * (main.MAX_VOCABULARY_HINTS_CHARS + 1)
+
+        live = self.client.post("/start", params={"vocabulary_hints": too_long})
+        uploaded = self.client.post(
+            "/transcribe-file",
+            params={"vocabulary_hints": too_long},
+            files={"file": ("sample.wav", b"audio bytes", "audio/wav")},
+        )
+
+        self.assertEqual(live.status_code, 422)
+        self.assertEqual(uploaded.status_code, 422)
+        self.assertIn("500 characters or fewer", live.json()["detail"])
+        self.assertIn("500 characters or fewer", uploaded.json()["detail"])
+
     def test_microphone_start_error_is_visible(self):
         with patch.object(main, "start_capture", side_effect=RuntimeError("no input device")):
             response = self.client.post("/start")
@@ -230,6 +309,60 @@ class ApiTests(unittest.TestCase):
         response = self.client.get("/transcript")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()[0]["text"], "hello")
+
+    def test_live_chunks_receive_bounded_previous_transcript_context(self):
+        stream = FakeStream()
+        first_chunk = object()
+        second_chunk = object()
+        chunks = iter([first_chunk, second_chunk, None])
+        first_words = [f"word{index}" for index in range(main.LIVE_CONTEXT_MAX_WORDS + 5)]
+
+        def fake_get_audio_chunk(_should_continue, _should_flush=None):
+            chunk = next(chunks)
+            if chunk is None:
+                with main.state_lock:
+                    main.is_running = False
+            return chunk
+
+        with main.state_lock:
+            main.is_running = True
+            main.active_stream = stream
+
+        first_segments = [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": " ".join(first_words),
+                "confidence": -0.1,
+                "needs_review": False,
+            }
+        ]
+        second_segments = [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "continued",
+                "confidence": -0.1,
+                "needs_review": False,
+            }
+        ]
+        with patch.object(main, "get_audio_chunk", side_effect=fake_get_audio_chunk), patch.object(
+            main, "is_speech", return_value=True
+        ), patch.object(
+            main, "transcribe", side_effect=[first_segments, second_segments]
+        ) as transcribe:
+            main.run_loop(stream, "Siobhan")
+
+        self.assertEqual(transcribe.call_args_list[0].args, (first_chunk,))
+        self.assertEqual(transcribe.call_args_list[0].kwargs, {"hotwords": "Siobhan"})
+        self.assertEqual(transcribe.call_args_list[1].args, (second_chunk,))
+        self.assertEqual(
+            transcribe.call_args_list[1].kwargs,
+            {
+                "hotwords": "Siobhan",
+                "initial_prompt": " ".join(first_words[-main.LIVE_CONTEXT_MAX_WORDS :]),
+            },
+        )
 
     def test_vad_checks_a_single_complete_frame(self):
         frame_samples = int(0.03 * 16000)
@@ -411,7 +544,7 @@ class ApiTests(unittest.TestCase):
             main, "diarize_transcript", side_effect=fake_diarize
         ):
             response = self.client.post(
-                "/transcribe-file?job_id=speakers-test",
+                "/transcribe-file?job_id=speakers-test&detect_speakers=true",
                 files={"file": ("meeting.wav", b"audio bytes", "audio/wav")},
             )
 
@@ -424,6 +557,83 @@ class ApiTests(unittest.TestCase):
         progress = self.client.get("/transcribe-file/progress/speakers-test").json()
         self.assertEqual(progress["status"], "complete")
         self.assertEqual(progress["percent"], 100.0)
+
+    def test_upload_skips_speaker_detection_when_disabled(self):
+        plain_transcription = {
+            "text": "No speaker labels here.",
+            "language": "en",
+            "duration": 3.0,
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 3.0,
+                    "text": "No speaker labels here.",
+                    "confidence": -0.1,
+                    "needs_review": False,
+                }
+            ],
+        }
+
+        def fake_transcribe_file(
+            _input_path,
+            _work_dir,
+            _extension,
+            progress_callback=None,
+            postprocess_callback=None,
+        ):
+            self.assertIsNone(postprocess_callback)
+            progress_callback(3.0, 3.0, "transcribing")
+            return plain_transcription
+
+        with patch.object(main, "transcribe_file", side_effect=fake_transcribe_file), patch.object(
+            main, "diarize_transcript"
+        ) as diarize:
+            response = self.client.post(
+                "/transcribe-file?job_id=no-speakers-test&detect_speakers=false",
+                files={"file": ("meeting.wav", b"audio bytes", "audio/wav")},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["text"], plain_transcription["text"])
+        self.assertNotIn("speaker_count", response.json())
+        self.assertNotIn("diarization_warning", response.json())
+        diarize.assert_not_called()
+
+        progress = self.client.get("/transcribe-file/progress/no-speakers-test").json()
+        self.assertEqual(progress["status"], "complete")
+        self.assertEqual(progress["percent"], 100.0)
+        self.assertEqual(progress["progress_metric"], "complete")
+
+    def test_upload_propagates_vocabulary_hints(self):
+        observed = {}
+
+        def fake_transcribe_file(
+            _input_path,
+            _work_dir,
+            _extension,
+            progress_callback=None,
+            postprocess_callback=None,
+            hotwords=None,
+        ):
+            observed["hotwords"] = hotwords
+            self.assertIsNone(postprocess_callback)
+            progress_callback(1.0, 1.0, "transcribing")
+            return {"text": "Oris Verba", "language": "en", "segments": [], "duration": 1.0}
+
+        with patch.object(main, "transcribe_file", side_effect=fake_transcribe_file):
+            response = self.client.post(
+                "/transcribe-file",
+                params={
+                    "job_id": "hinted-file-test",
+                    "detect_speakers": "false",
+                    "vocabulary_hints": "  Oris   Verba, CUDA  ",
+                },
+                files={"file": ("meeting.wav", b"audio bytes", "audio/wav")},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(observed["hotwords"], "Oris Verba, CUDA")
+        self.assertEqual(response.json()["text"], "Oris Verba")
 
     def test_diarization_failure_preserves_transcript(self):
         transcription = {
@@ -566,6 +776,29 @@ class MediaDecodeTests(unittest.TestCase):
         self.assertEqual(events[0], (0.0, 0.0, "preparing"))
         self.assertEqual(events[1], (0.0, 2.0, "transcribing"))
         self.assertEqual(events[-1], (0.5, 2.0, "transcribing"))
+
+    def test_hotwords_reach_faster_whisper_and_empty_hints_keep_defaults(self):
+        hinted_model = FakeModel()
+        with patch.object(scribe, "get_model", return_value=hinted_model):
+            scribe.transcribe(np.zeros(1600, dtype=np.float32), hotwords="Siobhan NASA")
+
+        self.assertEqual(hinted_model.options["hotwords"], "Siobhan NASA")
+
+        default_model = FakeModel()
+        with patch.object(scribe, "get_model", return_value=default_model):
+            scribe.transcribe(np.zeros(1600, dtype=np.float32), hotwords=None)
+
+        self.assertNotIn("hotwords", default_model.options)
+
+    def test_live_context_reaches_faster_whisper_as_initial_prompt(self):
+        model = FakeModel()
+        with patch.object(scribe, "get_model", return_value=model):
+            scribe.transcribe(
+                np.zeros(1600, dtype=np.float32),
+                initial_prompt="previous live words",
+            )
+
+        self.assertEqual(model.options["initial_prompt"], "previous live words")
 
     def test_vad_restored_timestamps_report_original_media_coverage(self):
         class VadInfo:

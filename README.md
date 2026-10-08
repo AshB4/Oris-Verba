@@ -77,16 +77,23 @@ Open <http://localhost:5173>.
 2. Click **Start**.
 3. Speak into the Mac's selected input device.
 4. Use **Pause**, **Resume**, and **Stop** as needed.
+5. After capture and final transcription finish, copy or download the transcript, or choose **New session / Clear transcript**. Clearing nonempty text asks for confirmation and clears both the backend session buffer and the displayed transcript.
 
 The microphone is opened by the local Python backend, not by the browser. On macOS, grant microphone access to the terminal application that starts the backend under **System Settings → Privacy & Security → Microphone**. Device and transcription failures appear in the UI.
+
+The homepage restores the backend's current live status and transcript when it loads, so refreshing the page does not hide an active or completed session. Between live audio chunks, the backend passes at most the previous 48 transcript words back to faster-whisper as context. This preserves bounded session context; it is not model training or a measured accuracy claim.
+
+The **Vocabulary hints** field can contain names, acronyms, and unusual words that faster-whisper may need help recognizing. Its value is remembered locally on this computer and is applied to new live sessions and file transcriptions. Hints use faster-whisper's native `hotwords` option; they remain separate from transcript text and are not automatic corrections.
 
 ## File transcription
 
 1. Select **Audio / video file**.
 2. Drag a file into the drop area or click **Choose file**.
-3. Click **Transcribe**.
-4. Edit the completed transcript if needed.
-5. Copy it, download it as `.txt`, or choose **New File / Reset**.
+3. Leave **Detect speakers** enabled for local speaker labels, or turn it off to skip diarization and return a plain transcript. The preference is remembered locally on this computer.
+4. Optionally enter names, acronyms, or unusual words under **Vocabulary hints**.
+5. Click **Transcribe**.
+6. Edit the completed transcript if needed.
+7. Copy it, download it as `.txt`, or choose **New File / Reset**.
 
 Supported formats:
 
@@ -98,7 +105,7 @@ Supported formats:
 - `.ogg`
 - `.webm`
 
-Uploads are written to a temporary local directory. Non-WAV media is decoded locally with FFmpeg, passed to the existing faster-whisper model, and removed after success or failure. Speaker detection then runs locally in its isolated process and aligns speaker turns with the timestamped Whisper segments. The editable `text` uses generic `Speaker 1`, `Speaker 2`, and similar labels without timestamps; timestamped speaker turns remain available in the response.
+Uploads are written to a temporary local directory. Non-WAV media is decoded locally with FFmpeg, passed to the existing faster-whisper model, and removed after success or failure. When **Detect speakers** is enabled, speaker detection runs locally in its isolated process and aligns speaker turns with the timestamped Whisper segments. The editable `text` uses generic `Speaker 1`, `Speaker 2`, and similar labels without timestamps; timestamped speaker turns remain available in the response. When disabled, diarization is skipped and the plain faster-whisper transcript is returned directly.
 
 While transcription is running, the homepage shows the actual browser upload bytes, an indeterminate **Preparing audio and loading model** phase, source-media coverage during transcription, and completion. faster-whisper removes silence before inference when VAD is enabled, then restores segment timestamps to the original recording timeline; Oris Verba uses those restored timestamps against the original duration so progress remains meaningful even when long silent sections were removed. Speaker detection reports completed diarization chunks when that optional phase is available.
 
@@ -108,13 +115,14 @@ If speaker detection is not installed or fails, the successful plain transcript 
 
 ## API
 
-- `POST /start` — open the local microphone and start live transcription
+- `POST /start` — open the local microphone and start live transcription; optional `vocabulary_hints` query parameter
 - `POST /pause` — pause live processing
 - `POST /resume` — resume live processing
 - `POST /stop` — stop live capture and close the stream
 - `GET /status` — live state and any capture error
 - `GET /transcript` — live transcript segments
-- `POST /transcribe-file` — transcribe one uploaded file
+- `DELETE /transcript` — clear a finished live-transcription session
+- `POST /transcribe-file` — transcribe one uploaded file; optional `detect_speakers` and `vocabulary_hints` query parameters
 - `GET /transcribe-file/progress/{job_id}` — read local file-transcription progress
 - `GET /docs` — interactive API documentation
 

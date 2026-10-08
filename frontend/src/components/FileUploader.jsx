@@ -9,6 +9,10 @@ function FileUploader({
   onTranscribe,
   onReset,
   acceptedExtensions,
+  detectSpeakers,
+  onDetectSpeakersChange,
+  vocabularyHints,
+  onVocabularyHintsChange,
 }) {
   return (
     <section className="work-card file-card" id="file-panel" role="tabpanel">
@@ -19,6 +23,21 @@ function FileUploader({
           <p>Choose a recording from this computer. Nothing is uploaded to an external service.</p>
         </div>
       </div>
+
+      <label className="vocabulary-field">
+        <span>
+          <strong>Vocabulary hints</strong>
+          <small>Words the transcriber may need help recognizing.</small>
+        </span>
+        <input
+          type="text"
+          value={vocabularyHints}
+          onChange={(event) => onVocabularyHintsChange(event.target.value)}
+          maxLength={500}
+          placeholder="Names, acronyms, unusual words"
+          autoComplete="off"
+        />
+      </label>
 
       <label
         className={`drop-zone ${isDragging ? "dragging" : ""}`}
@@ -52,6 +71,18 @@ function FileUploader({
           accept={acceptedExtensions}
           onChange={(event) => onChooseFile(event.target.files[0])}
         />
+      </label>
+
+      <label className="file-option">
+        <input
+          type="checkbox"
+          checked={detectSpeakers}
+          onChange={(event) => onDetectSpeakersChange(event.target.checked)}
+        />
+        <span>
+          <strong>Detect speakers</strong>
+          <small>Add local Speaker 1, Speaker 2, and similar labels.</small>
+        </span>
       </label>
 
       {selectedFile && (
